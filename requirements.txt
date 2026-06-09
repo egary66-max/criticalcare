@@ -1,3 +1,8 @@
 streamlit>=1.30
 anthropic>=0.40
-chromadb>=0.5
+chromadb>=0.5.5
+protobuf>=4.25.3,<6
+opentelemetry-proto>=1.25.0
+opentelemetry-exporter-otlp-proto-grpc>=1.25.0
+opentelemetry-sdk>=1.25.0
+grpcio>=1.62
