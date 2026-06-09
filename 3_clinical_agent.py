@@ -209,7 +209,8 @@ for key, default in [
     ("quiz_difficulty_tier", 1),
     ("quiz_case", None),
     ("quiz_questions", None),
-    ("quiz_current_q", "mc"),
+    ("quiz_queue", []),
+    ("quiz_queue_idx", 0),
     ("quiz_answers_log", []),
     ("quiz_specialist_id", None),
     ("quiz_image_bytes", None),
@@ -429,7 +430,8 @@ with tab_consult:
 def _reset_quiz_state():
     st.session_state.quiz_case = None
     st.session_state.quiz_questions = None
-    st.session_state.quiz_current_q = "mc"
+    st.session_state.quiz_queue = []
+    st.session_state.quiz_queue_idx = 0
     st.session_state.quiz_answers_log = []
     st.session_state.quiz_specialist_id = None
     st.session_state.quiz_image_bytes = None
@@ -438,10 +440,13 @@ def _reset_quiz_state():
     st.session_state.quiz_last_grade = None
 
 
-def _next_q_after(current: str, image_loaded: bool) -> str:
-    order = ["mc", "fitb", "fr", "image" if image_loaded else "done", "done"]
-    idx = order.index(current)
-    return order[idx + 1]
+def _build_quiz_queue(qs: dict) -> list:
+    """Flatten the question dict into an ordered queue of (format, sub_index) pairs."""
+    queue = []
+    for fmt in ("mc", "fitb", "fr"):
+        for i in range(len(qs.get(fmt, []))):
+            queue.append((fmt, i))
+    return queue
 
 
 with tab_quiz:
@@ -449,7 +454,8 @@ with tab_quiz:
     tier_info = quiz.DIFFICULTY_TIERS[tier]
     st.markdown(
         f"**Current tier:** {tier}/5 — *{tier_info['label']}*  \n"
-        "Random ER specialist each case. Score ≥ 70% to advance a tier."
+        f"Each case: {quiz.NUM_MC} MC · {quiz.NUM_FITB} fill-in-blank · {quiz.NUM_FR} free-response "
+        "(plus optional image). Score ≥ 70% to advance a tier."
     )
 
     case = st.session_state.quiz_case
@@ -461,14 +467,18 @@ with tab_quiz:
         with col1:
             if st.button("🎲 Start New Case", type="primary", use_container_width=True):
                 sid = quiz.pick_random_specialist()
-                with st.spinner(f"Generating a {tier_info['label'].lower()} case from {SPECIALIST_MAP[sid]['name']}..."):
+                with st.spinner(
+                    f"Generating a {tier_info['label'].lower()} case from "
+                    f"{SPECIALIST_MAP[sid]['name']} and {quiz.NUM_MC + quiz.NUM_FITB + quiz.NUM_FR} questions..."
+                ):
                     try:
                         new_case = quiz.generate_case(sid, tier, st.session_state.collection, ANTHROPIC_API_KEY)
                         new_qs = quiz.generate_questions(new_case, sid, tier, st.session_state.collection, ANTHROPIC_API_KEY)
                         st.session_state.quiz_specialist_id = sid
                         st.session_state.quiz_case = new_case
                         st.session_state.quiz_questions = new_qs
-                        st.session_state.quiz_current_q = "mc"
+                        st.session_state.quiz_queue = _build_quiz_queue(new_qs)
+                        st.session_state.quiz_queue_idx = 0
                         st.session_state.quiz_answers_log = []
                         st.session_state.quiz_last_grade = None
                         st.rerun()
@@ -494,17 +504,24 @@ with tab_quiz:
             if case.get("initial_diagnostics"):
                 st.markdown(f"**Initial diagnostics:** {case['initial_diagnostics']}")
 
-        # Optional image upload — shown until user uploads or finishes the case
+        queue = st.session_state.quiz_queue
+        qidx = st.session_state.quiz_queue_idx
+        total = len(queue)
+        case_done = qidx >= total
+
+        # Optional image upload — only while case is in progress and no image yet
         suggested = case.get("suggested_image")
         if (
             suggested
             and st.session_state.quiz_image_bytes is None
-            and "image" not in (qs or {})
-            and st.session_state.quiz_current_q != "done"
+            and not qs.get("image")
+            and not case_done
         ):
             label = quiz.MODALITY_LABELS.get(suggested.get("modality", ""), "image")
-            st.info(f"💡 This case suggests a **{label}**: {suggested.get('prompt','')}. "
-                    "Upload one for a bonus image-interpretation question, or skip.")
+            st.info(
+                f"💡 This case suggests a **{label}**: {suggested.get('prompt','')}. "
+                "Upload one for a bonus image-interpretation question, or skip."
+            )
             uploaded = st.file_uploader(
                 f"Upload a {label} (png/jpg, ≤ 8 MB)",
                 type=["png", "jpg", "jpeg"],
@@ -527,16 +544,25 @@ with tab_quiz:
                                 suggested["modality"],
                                 ANTHROPIC_API_KEY,
                             )
-                            qs["image"] = iq
+                            qs["image"] = [iq]
                             st.session_state.quiz_questions = qs
+                            st.session_state.quiz_queue.append(("image", 0))
                             st.rerun()
                         except Exception as e:
                             st.error(f"Image question failed: {e}")
 
         st.divider()
 
-        current = st.session_state.quiz_current_q
-        image_loaded = "image" in (qs or {})
+        # Refresh after possible queue mutation above
+        queue = st.session_state.quiz_queue
+        total = len(queue)
+        qidx = st.session_state.quiz_queue_idx
+        case_done = qidx >= total
+        fmt, sub_idx = (None, None) if case_done else queue[qidx]
+
+        # Progress header
+        if not case_done:
+            st.markdown(f"**Question {qidx + 1} of {total}** · *{fmt.upper()}*")
 
         # Show last-grade feedback (sticky until user clicks Next)
         last = st.session_state.quiz_last_grade
@@ -556,7 +582,7 @@ with tab_quiz:
                 st.markdown("**Missed points:**")
                 for p in last["missed_points"]:
                     st.markdown(f"- {p}")
-            if last.get("sample_answer") and current in ("fr", "image"):
+            if last.get("sample_answer") and fmt in ("fr", "image"):
                 with st.expander("Model answer"):
                     st.markdown(last["sample_answer"])
             if last.get("explanation"):
@@ -567,42 +593,41 @@ with tab_quiz:
                     for c in last["citations"]:
                         st.markdown(f"- {c}")
 
-            next_label = "Next question →" if _next_q_after(current, image_loaded) != "done" else "See case summary →"
+            next_label = "Next question →" if (qidx + 1) < total else "See case summary →"
             if st.button(next_label, type="primary"):
-                st.session_state.quiz_current_q = _next_q_after(current, image_loaded)
+                st.session_state.quiz_queue_idx += 1
                 st.session_state.quiz_last_grade = None
                 st.rerun()
 
-        # --- Current question widgets (only when no pending grade) -----------
-        elif current == "mc":
-            q = qs["mc"]
-            st.markdown(f"#### Multiple Choice")
+        elif fmt == "mc":
+            q = qs["mc"][sub_idx]
+            st.markdown("#### Multiple Choice")
             st.markdown(q["stem"])
-            choice = st.radio("Pick one", q["options"], index=None, key="quiz_mc_choice")
+            choice = st.radio("Pick one", q["options"], index=None, key=f"quiz_mc_choice_{qidx}")
             if st.button("Submit answer", type="primary", disabled=choice is None):
                 grade = quiz.grade_multiple_choice(q, q["options"].index(choice))
                 st.session_state.quiz_answers_log.append({"q": "mc", **grade})
                 st.session_state.quiz_last_grade = grade
                 st.rerun()
 
-        elif current == "fitb":
-            q = qs["fitb"]
-            st.markdown(f"#### Fill in the Blanks")
+        elif fmt == "fitb":
+            q = qs["fitb"][sub_idx]
+            st.markdown("#### Fill in the Blanks")
             st.markdown(q["stem_with_blanks"])
             answers = []
             for i, _ in enumerate(q["accepted_answers"]):
-                answers.append(st.text_input(f"Blank {i + 1}", key=f"quiz_fitb_{i}"))
+                answers.append(st.text_input(f"Blank {i + 1}", key=f"quiz_fitb_{qidx}_{i}"))
             if st.button("Submit answers", type="primary"):
                 grade = quiz.grade_fill_in_blank(q, answers)
                 st.session_state.quiz_answers_log.append({"q": "fitb", **grade})
                 st.session_state.quiz_last_grade = grade
                 st.rerun()
 
-        elif current == "fr":
-            q = qs["fr"]
-            st.markdown(f"#### Free Response")
+        elif fmt == "fr":
+            q = qs["fr"][sub_idx]
+            st.markdown("#### Free Response")
             st.markdown(q["stem"])
-            user_text = st.text_area("Your answer", height=180, key="quiz_fr_text")
+            user_text = st.text_area("Your answer", height=180, key=f"quiz_fr_text_{qidx}")
             if st.button("Submit answer", type="primary"):
                 with st.spinner("Grading..."):
                     try:
@@ -613,12 +638,15 @@ with tab_quiz:
                     except Exception as e:
                         st.error(f"Grading failed: {e}")
 
-        elif current == "image":
-            q = qs["image"]
-            st.markdown(f"#### Image Interpretation")
-            st.image(st.session_state.quiz_image_bytes, caption=quiz.MODALITY_LABELS.get(q.get("modality", ""), "image"))
+        elif fmt == "image":
+            q = qs["image"][sub_idx]
+            st.markdown("#### Image Interpretation")
+            st.image(
+                st.session_state.quiz_image_bytes,
+                caption=quiz.MODALITY_LABELS.get(q.get("modality", ""), "image"),
+            )
             st.markdown(q["stem"])
-            user_text = st.text_area("Your interpretation", height=180, key="quiz_img_text")
+            user_text = st.text_area("Your interpretation", height=180, key=f"quiz_img_text_{qidx}")
             if st.button("Submit answer", type="primary"):
                 with st.spinner("Grading..."):
                     try:
@@ -635,12 +663,15 @@ with tab_quiz:
                     except Exception as e:
                         st.error(f"Grading failed: {e}")
 
-        elif current == "done":
+        elif case_done:
             log = st.session_state.quiz_answers_log
             avg = sum(a.get("score", 0) for a in log) / max(len(log), 1)
             st.markdown(f"### Case complete · Average score: {int(avg * 100)}%")
-            for a in log:
-                st.markdown(f"- **{a['q'].upper()}**: {int(a['score'] * 100)}%")
+            for q_type in ("mc", "fitb", "fr", "image"):
+                scores = [a.get("score", 0) for a in log if a.get("q") == q_type]
+                if scores:
+                    per_type = sum(scores) / len(scores)
+                    st.markdown(f"- **{q_type.upper()}** ({len(scores)} q): {int(per_type * 100)}%")
 
             with st.container(border=True):
                 st.markdown(f"**Correct diagnosis:** {case.get('correct_diagnosis', '')}")

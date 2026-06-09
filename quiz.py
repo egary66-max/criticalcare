@@ -22,11 +22,18 @@ import base64
 import json
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import anthropic
 
 from specialists import SPECIALIST_MAP, build_passages_context, search_for_specialist
+
+
+# Number of questions per case, per format.
+NUM_MC = 10
+NUM_FITB = 3
+NUM_FR = 1
 
 
 MODEL = "claude-sonnet-4-6"
@@ -213,71 +220,179 @@ def generate_case(specialist_id: str, tier: int, collection, api_key: str) -> di
 
 # ── Question generation ───────────────────────────────────────────────────────
 
-QUESTION_GEN_INSTRUCTION = """You are writing teaching questions for a small-animal ER intern based on a case you generated.
+MC_GEN_INSTRUCTION = """You are writing multiple-choice questions for a small-animal ER intern based on a case you generated.
 
 DIFFICULTY TIER: {tier} — {tier_label}
 
-Produce exactly THREE questions about the case below. Each question targets a different angle:
-  - "mc"   : a 4-option multiple choice testing pathophysiology or mechanism.
-  - "fitb" : a fill-in-the-blank testing a key drug (MOA, dose, or class).
-  - "fr"   : a free-response testing clinical decision-making (next step, when to act, what to monitor).
+Produce EXACTLY {n} four-option multiple-choice questions about the case below. \
+The {n} questions must cover DIFFERENT angles — do not repeat themes. Aim for variety across:
+  - pathophysiology / mechanism of disease
+  - differential diagnosis discrimination
+  - drug mechanism of action
+  - drug dose, route, or contraindication
+  - diagnostic test selection or interpretation
+  - monitoring parameters
+  - complications and red flags
+  - decision points (when to escalate, when to call surgery, when NOT to treat)
 
-Return ONLY valid JSON in this exact schema (no markdown, no commentary):
+Return ONLY valid JSON (no markdown, no commentary) in this exact schema:
 
 {{
-  "mc": {{
-    "stem": "the question",
-    "options": ["A …", "B …", "C …", "D …"],
-    "answer_index": 0,
-    "explanation": "1-3 sentences explaining why the correct answer is correct and why distractors are not"
-  }},
-  "fitb": {{
-    "stem_with_blanks": "Drug X is the ___ of choice for ___ at a dose of ___ mg/kg.",
-    "accepted_answers": [["drug-of-choice-synonyms"], ["condition", "synonym"], ["0.5", "0.5 mg/kg"]],
-    "explanation": "1-3 sentences explaining the answer"
-  }},
-  "fr": {{
-    "stem": "the question",
-    "rubric": ["3-5 short bullet points of what a complete answer must contain"],
-    "sample_answer": "A model answer that hits every rubric point in 3-6 sentences"
-  }}
+  "mc": [
+    {{
+      "stem": "the question",
+      "options": ["A …", "B …", "C …", "D …"],
+      "answer_index": 0,
+      "explanation": "1-3 sentences on why correct answer is correct and why distractors are wrong"
+    }},
+    ... {n} entries total ...
+  ]
 }}
 
 Rules:
-- "accepted_answers" is a list-of-lists: one inner list per blank, containing all forms you would accept (case-insensitive, punctuation-insensitive).
-- The MC stem and the FR stem must NOT reveal the correct diagnosis if the intern has not yet been asked for it.
-- Make each question genuinely useful for an overnight ER shift.
-- Difficulty must match the tier: easy/classic at tier 1, expert nuance at tier 5.
+- Stems must NOT reveal the diagnosis or treatment unless that specific question is asking for it.
+- Distractors must be plausible — wrong but tempting, not silly.
+- Difficulty matches the tier: easy/classic at tier 1, expert nuance at tier 5.
 
 CASE:
 {case_json}
 """
 
 
-def generate_questions(
-    case: dict, specialist_id: str, tier: int, collection, api_key: str
-) -> dict:
-    """Generate {mc, fitb, fr} for a given case."""
+FITB_GEN_INSTRUCTION = """You are writing fill-in-the-blank questions for a small-animal ER intern based on a case you generated.
+
+DIFFICULTY TIER: {tier} — {tier_label}
+
+Produce EXACTLY {n} fill-in-the-blank questions about the case below. Each question \
+must target a DIFFERENT fact (different drug, different value, different mechanism). Useful targets:
+  - drug name + dose + route + frequency
+  - mechanism-of-action wording for a key drug
+  - critical lab cutoff or threshold value
+  - definitive diagnostic test name
+  - reversal agent / antidote name + dose
+
+Return ONLY valid JSON (no markdown, no commentary):
+
+{{
+  "fitb": [
+    {{
+      "stem_with_blanks": "Drug X is the ___ of choice for ___ at a dose of ___ mg/kg IV q ___ hours.",
+      "accepted_answers": [["drug"], ["condition", "synonym"], ["0.5"], ["6"]],
+      "explanation": "1-3 sentences on the answer"
+    }},
+    ... {n} entries total ...
+  ]
+}}
+
+Rules:
+- "accepted_answers" is a list-of-lists: ONE inner list per blank, with every form you'd accept (case-insensitive, punctuation-insensitive). Include common synonyms and abbreviations.
+- Each question should have 2-4 blanks — enough to test, not so many it's a paragraph.
+- Difficulty matches the tier.
+
+CASE:
+{case_json}
+"""
+
+
+FR_GEN_INSTRUCTION = """You are writing free-response clinical-reasoning questions for a small-animal ER intern based on a case you generated.
+
+DIFFICULTY TIER: {tier} — {tier_label}
+
+Produce EXACTLY {n} free-response question(s) about the case below. The question must \
+test clinical decision-making (next step, treatment choice, prioritization, when to escalate, \
+what to monitor), NOT memorization.
+
+Return ONLY valid JSON (no markdown, no commentary):
+
+{{
+  "fr": [
+    {{
+      "stem": "the question",
+      "rubric": ["3-5 short bullets of what a complete answer must contain"],
+      "sample_answer": "A 3-6 sentence model answer that hits every rubric point"
+    }},
+    ... {n} entries total ...
+  ]
+}}
+
+Rules:
+- The stem can reveal the diagnosis if it's about treatment/management; don't reveal if asking the intern to commit to a working diagnosis.
+- Rubric points are the GRADING checklist — be specific and concrete.
+
+CASE:
+{case_json}
+"""
+
+
+def _generate_question_batch(
+    format_key: str,
+    instruction_template: str,
+    n: int,
+    case: dict,
+    specialist_id: str,
+    tier: int,
+    collection,
+    api_key: str,
+) -> tuple:
+    """Generate one batch of questions (10 MC, 3 FITB, or 1 FR). Returns (format_key, list, citations)."""
     tier_info = DIFFICULTY_TIERS[tier]
     case_for_prompt = {k: v for k, v in case.items() if not k.startswith("_")}
-    instruction = QUESTION_GEN_INSTRUCTION.format(
+    instruction = instruction_template.format(
         tier=tier,
         tier_label=tier_info["label"],
+        n=n,
         case_json=json.dumps(case_for_prompt, indent=2),
     )
     query = (
         f"{case.get('correct_diagnosis', '')} "
-        f"{' '.join(d.get('name', '') for d in case.get('key_drugs', []))}"
+        f"{' '.join(d.get('name', '') for d in case.get('key_drugs', []))} "
+        f"{format_key} questions"
     )
-    qs = _call_specialist_for_json(
-        specialist_id, instruction, query, collection, api_key, max_tokens=2000
+    # Each MC takes ~150-200 tokens; size max_tokens accordingly.
+    per_q = {"mc": 220, "fitb": 180, "fr": 500}.get(format_key, 250)
+    max_tokens = max(1000, n * per_q + 400)
+    raw = _call_specialist_for_json(
+        specialist_id, instruction, query, collection, api_key, max_tokens=max_tokens
     )
-    # Attach citations to each question so the UI can render them.
-    citations = qs.pop("_citations", [])
-    for key in ("mc", "fitb", "fr"):
-        if key in qs:
-            qs[key].setdefault("citations", citations)
-    return qs
+    citations = raw.pop("_citations", [])
+    items = raw.get(format_key, [])
+    for q in items:
+        q.setdefault("citations", citations)
+    return format_key, items, citations
+
+
+def generate_questions(
+    case: dict, specialist_id: str, tier: int, collection, api_key: str
+) -> dict:
+    """
+    Generate question batches per case: 10 MC + 3 FITB + 1 FR. Three Claude calls run in parallel.
+    Returns {mc: [...10], fitb: [...3], fr: [...1]}.
+    """
+    batches = [
+        ("mc", MC_GEN_INSTRUCTION, NUM_MC),
+        ("fitb", FITB_GEN_INSTRUCTION, NUM_FITB),
+        ("fr", FR_GEN_INSTRUCTION, NUM_FR),
+    ]
+    result = {"mc": [], "fitb": [], "fr": []}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(
+                _generate_question_batch,
+                fkey,
+                tmpl,
+                n,
+                case,
+                specialist_id,
+                tier,
+                collection,
+                api_key,
+            )
+            for fkey, tmpl, n in batches
+        ]
+        for fut in futures:
+            fkey, items, _ = fut.result()
+            result[fkey] = items
+    return result
 
 
 # ── Graders ───────────────────────────────────────────────────────────────────
