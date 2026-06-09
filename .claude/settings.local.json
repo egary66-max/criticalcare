@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/erikgary/**)",
+      "Bash(pip3 install ebooklib beautifulsoup4 anthropic chromadb sentence-transformers --quiet)",
+      "Bash(pip3 install ebooklib beautifulsoup4 anthropic chromadb)",
+      "Bash(python3 1_extract_book.py)",
+      "Bash(pip3 install streamlit --quiet)",
+      "Bash(ANTHROPIC_API_KEY=\"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\" python3 2_build_database.py)",
+      "Bash(ANTHROPIC_API_KEY=\"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\" python3 -m streamlit run 3_clinical_agent.py)"
+    ]
+  }
+}
