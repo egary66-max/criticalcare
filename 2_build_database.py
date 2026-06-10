@@ -41,11 +41,16 @@ def main():
     print("\nEmbedding and storing chunks (this takes a few minutes)...")
     BATCH_SIZE = 50
 
+    BOOK_LABEL = "Small Animal Critical Care Medicine"
+
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i:i + BATCH_SIZE]
         ids = [f"chunk_{i + j}" for j in range(len(batch))]
         documents = [c["text"] for c in batch]
-        metadatas = [{"chapter": c["chapter"], "chunk_index": c["chunk_index"]} for c in batch]
+        metadatas = [
+            {"book": BOOK_LABEL, "chapter": c["chapter"], "chunk_index": c["chunk_index"]}
+            for c in batch
+        ]
 
         collection.add(
             ids=ids,
