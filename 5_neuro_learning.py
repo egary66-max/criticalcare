@@ -20,6 +20,14 @@ st.set_page_config(
 # ── API key ───────────────────────────────────────────────────────────────────
 
 def _load_api_key() -> str:
+    # 1. Streamlit Cloud secrets
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    # 2. Local .env file
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -27,6 +35,7 @@ def _load_api_key() -> str:
                 line = line.strip()
                 if line.startswith("ANTHROPIC_API_KEY="):
                     return line.split("=", 1)[1].strip()
+    # 3. Environment variable
     return os.environ.get("ANTHROPIC_API_KEY", "")
 
 
