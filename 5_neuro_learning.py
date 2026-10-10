@@ -79,8 +79,11 @@ except Exception as e:
 
 # ── Session state defaults ────────────────────────────────────────────────────
 
+_TAB_LABELS = ["🗺️ Roadmap", "📚 Study", "🔄 Review", "⚡ Rapid Recall", "📊 Progress"]
+
 _DEFAULTS = {
     "progress": None,                  # loaded from JSON
+    "active_tab": "🗺️ Roadmap",        # current navigation tab
     "active_topic_id": None,           # current study/review topic
     "study_note": None,                # generated study note dict
     "questions": None,                 # {mc, fitb, fr, citations}
@@ -157,6 +160,18 @@ with st.sidebar:
     st.markdown("*ACVIM Boards Prep*")
     st.divider()
 
+    # ── Navigation ────────────────────────────────────────────────────────────
+    selected = st.radio(
+        "Navigate",
+        _TAB_LABELS,
+        index=_TAB_LABELS.index(st.session_state.active_tab),
+        label_visibility="collapsed",
+    )
+    if selected != st.session_state.active_tab:
+        st.session_state.active_tab = selected
+        st.rerun()
+
+    st.divider()
     stats = get_overall_stats(progress, ALL_TOPIC_IDS)
     due_n = _due_count()
 
@@ -182,18 +197,16 @@ with st.sidebar:
         st.rerun()
 
 
-# ── Main tabs ─────────────────────────────────────────────────────────────────
+# ── Active tab ────────────────────────────────────────────────────────────────
 
-tab_roadmap, tab_study, tab_review, tab_recall, tab_progress = st.tabs(
-    ["🗺️ Roadmap", "📚 Study", "🔄 Review", "⚡ Rapid Recall", "📊 Progress"]
-)
+_active = st.session_state.active_tab
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ROADMAP
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_roadmap:
+if _active == "🗺️ Roadmap":
     st.title("Curriculum Roadmap")
     st.caption("25 topics · 4 phases · ACVIM Neurology Boards framework")
 
@@ -240,6 +253,7 @@ with tab_roadmap:
                         _reset_study()
                         st.session_state.active_topic_id = topic["id"]
                         st.session_state.session_phase = "note"
+                        st.session_state.active_tab = "📚 Study"
                         st.rerun()
 
         st.divider()
@@ -249,7 +263,7 @@ with tab_roadmap:
 # TAB 2 — STUDY MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_study:
+if _active == "📚 Study":
     st.title("Study Mode")
 
     # ── Topic selector ────────────────────────────────────────────────────────
@@ -514,7 +528,7 @@ with tab_study:
 # TAB 3 — REVIEW (spaced repetition)
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_review:
+if _active == "🔄 Review":
     st.title("Spaced Repetition Review")
 
     due_ids = get_due_topics(progress, ALL_TOPIC_IDS)
@@ -561,6 +575,7 @@ with tab_review:
                         _reset_study()
                         st.session_state.active_topic_id = tid
                         st.session_state.session_phase = "note"
+                        st.session_state.active_tab = "📚 Study"
                         st.rerun()
 
 
@@ -568,7 +583,7 @@ with tab_review:
 # TAB 4 — RAPID RECALL
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_recall:
+if _active == "⚡ Rapid Recall":
     st.title("Rapid Recall")
     st.caption(
         "10 MC questions drawn from your weakest topics. "
@@ -682,7 +697,7 @@ with tab_recall:
 # TAB 5 — PROGRESS
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_progress:
+if _active == "📊 Progress":
     st.title("Progress Dashboard")
 
     stats = get_overall_stats(progress, ALL_TOPIC_IDS)
